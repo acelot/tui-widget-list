@@ -36,8 +36,19 @@ pub(crate) fn compute_viewport_layout<T>(
     // The items heights on the viewport will be calculated on the fly.
     let mut viewport: HashMap<usize, ViewportElement<T>> = HashMap::new();
 
+    state.hidden_elements.clear();
+    for index in 0..item_count {
+        let (_, size) = cacher.get(index);
+        if size == 0 {
+            state.hidden_elements.insert(index);
+        }
+    }
+
     // If none is selected, the first item should be show on top of the viewport.
-    let selected = state.selected.unwrap_or(0);
+    let selected = state
+        .selected
+        .or_else(|| state.get_first_index_not_less_than(0))
+        .unwrap_or(0);
 
     // Calculate the effective scroll padding for each widget
     let effective_scroll_padding_by_index = calculate_effective_scroll_padding(

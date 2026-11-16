@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui_core::layout::Rect;
 use ratatui_widgets::scrollbar::ScrollbarState;
@@ -33,6 +33,9 @@ pub struct ListState {
     /// The scrollbar state. This is only used if the view is
     /// initialzed with a scrollbar.
     pub(crate) scrollbar_state: ScrollbarState,
+
+    /// Hidden elements that can't be selected
+    pub(crate) hidden_elements: HashSet<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +90,7 @@ impl Default for ListState {
             item_scroll: 0,
             view_state: ViewState::default(),
             scrollbar_state: ScrollbarState::new(0).position(0),
+            hidden_elements: HashSet::default(),
         }
     }
 }
@@ -129,6 +133,32 @@ impl ListState {
         }
     }
 
+    pub fn select_first(&mut self) {
+        self.select(self.get_first_index_not_less_than(0));
+    }
+
+    pub fn select_last(&mut self) {
+        self.select(self.get_last_index_less_than(self.num_elements));
+    }
+
+    pub(crate) fn get_first_index_not_less_than(&self, min_valid_index: usize) -> Option<usize> {
+        for i in min_valid_index..self.num_elements {
+            if !self.hidden_elements.contains(&i) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn get_last_index_less_than(&self, less_than_idx: usize) -> Option<usize> {
+        for i in (0..less_than_idx.min(self.num_elements)).rev() {
+            if !self.hidden_elements.contains(&i) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Selects the next element of the list. If `inifinite_scrolling`
     /// is true, calling next on the last element selects the first.
     ///
@@ -153,20 +183,19 @@ impl ListState {
             }
         }
         let i = match self.selected {
-            Some(i) => {
-                if i >= self.num_elements - 1 {
+            Some(original_index) => {
+                let new_index: Option<usize> = self.get_first_index_not_less_than(original_index + 1);
+                new_index.or_else(|| {
                     if self.infinite_scrolling {
-                        0
+                        self.get_first_index_not_less_than(0)
                     } else {
-                        i
+                        self.get_last_index_less_than(original_index + 1)
                     }
-                } else {
-                    i + 1
-                }
+                })
             }
-            None => 0,
+            None => self.get_first_index_not_less_than(0),
         };
-        self.select(Some(i));
+        self.select(i);
     }
 
     /// Selects the previous element of the list. If `infinite_scrolling`
@@ -190,27 +219,29 @@ impl ListState {
             return;
         }
         let i = match self.selected {
-            Some(i) => {
-                if i == 0 {
+            Some(original_index) => {
+                let original_index = original_index;
+                let new_index = self.get_last_index_less_than(original_index);
+                new_index.or_else(|| {
                     if self.infinite_scrolling {
-                        self.num_elements - 1
+                        self.get_last_index_less_than(self.num_elements)
                     } else {
-                        i
+                        self.get_first_index_not_less_than(original_index)
                     }
-                } else {
-                    i - 1
-                }
+                })
             }
-            None => self.num_elements - 1,
+            None => self.get_last_index_less_than(self.num_elements),
         };
         // If the previous item overflows the viewport, start at its bottom
-        let overflow = self.item_overflow(i);
-        if overflow > 0 {
-            self.selected = Some(i);
-            self.item_scroll = overflow;
-            return;
+        if let Some(i) = i {
+            let overflow = self.item_overflow(i);
+            if overflow > 0 {
+                self.selected = Some(i);
+                self.item_scroll = overflow;
+                return;
+            }
         }
-        self.select(Some(i));
+        self.select(i);
     }
 
     /// Returns the index of the first item currently displayed on the screen.
@@ -341,5 +372,144 @@ impl ListState {
     #[must_use]
     pub(crate) fn item_scroll(&self) -> u16 {
         self.item_scroll
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn test_list_state(hidden_elements: &[usize]) -> ListState {
+        let mut list_state = ListState::default();
+        list_state.set_infinite_scrolling(false);
+        list_state.set_num_elements(6);
+        list_state.hidden_elements.extend(hidden_elements);
+        list_state
+    }
+
+    #[test]
+    fn test_next_with_hidden_in_the_middle() {
+        // given
+        let mut list_state = test_list_state(&[2, 4]);
+        let expected_sequence: [Option<usize>; _] = [Some(0), Some(1), Some(3), Some(5), Some(5)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+
+        // given
+        let mut list_state = test_list_state(&[2, 4]);
+        list_state.set_infinite_scrolling(true);
+        let expected_sequence: [Option<usize>; _] =
+            [Some(0), Some(1), Some(3), Some(5), Some(0), Some(1)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+    }
+
+    #[test]
+    fn test_next_with_hidden_in_the_begin() {
+        // given
+        let mut list_state = test_list_state(&[0, 1]);
+        let expected_sequence: [Option<usize>; _] = [Some(2), Some(3), Some(4), Some(5), Some(5)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+
+        // given
+        let mut list_state = test_list_state(&[0, 1]);
+        list_state.set_infinite_scrolling(true);
+        let expected_sequence: [Option<usize>; _] =
+            [Some(2), Some(3), Some(4), Some(5), Some(2), Some(3)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+    }
+
+    #[test]
+    fn test_next_with_hidden_in_the_end() {
+        // given
+        let mut list_state = test_list_state(&[4, 5]);
+        let expected_sequence: [Option<usize>; _] = [Some(0), Some(1), Some(2), Some(3), Some(3)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+
+        // given
+        let mut list_state = test_list_state(&[4, 5]);
+        list_state.set_infinite_scrolling(true);
+        let expected_sequence: [Option<usize>; _] =
+            [Some(0), Some(1), Some(2), Some(3), Some(0), Some(1)];
+        for expected_index in expected_sequence {
+            // when
+            list_state.next();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+    }
+
+    #[test]
+    fn test_previous_with_hidden_in_the_middle() {
+        // given
+        let mut list_state = test_list_state(&[2, 4]);
+        let expected_sequence: [Option<usize>; _] = [Some(5), Some(3), Some(1), Some(0), Some(0)];
+
+        for expected_index in expected_sequence {
+            // when
+            list_state.previous();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+    }
+
+    #[test]
+    fn test_previous_with_hidden_in_the_begin() {
+        // given
+        let mut list_state = test_list_state(&[0, 1]);
+        let expected_sequence: [Option<usize>; _] = [Some(5), Some(4), Some(3), Some(2), Some(2)];
+
+        for expected_index in expected_sequence {
+            // when
+            list_state.previous();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
+    }
+
+    #[test]
+    fn test_previous_with_hidden_in_the_end() {
+        // given
+        let mut list_state = test_list_state(&[4, 5]);
+        let expected_sequence: [Option<usize>; _] = [Some(3), Some(2), Some(1), Some(0), Some(0)];
+
+        for expected_index in expected_sequence {
+            // when
+            list_state.previous();
+
+            // then
+            assert_eq!(list_state.selected, expected_index);
+        }
     }
 }
