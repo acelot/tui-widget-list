@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ratatui_core::layout::Rect;
 use ratatui_widgets::scrollbar::ScrollbarState;
 
-use crate::{ListBuildContext, ListBuilder, ScrollAxis, ScrollDirection};
+use crate::{ListBuildContext, ListBuilder, ScrollAxis};
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone)]
@@ -25,6 +25,14 @@ pub struct ListState {
     /// Scroll offset within the currently selected item. When an item is larger
     /// than the viewport, this tracks how far we've scrolled into it.
     pub(crate) item_scroll: u16,
+
+    /// Indicates whether the content should be anchored to the end of the
+    /// viewport. It is set when the selection moves below the bottom item of
+    /// the viewport while scrolling down and cleared when it moves above the
+    /// top item while scrolling up.
+    ///
+    /// This is only used for lists with a `ScrollDirection::Backward`.
+    pub(crate) anchor_to_end: bool,
 
     /// The state for the viewport. Keeps track which item to show
     /// first and how much it is truncated.
@@ -53,11 +61,15 @@ pub(crate) struct ViewState {
     /// The scroll axis used during the last render.
     pub(crate) scroll_axis: ScrollAxis,
 
-    /// The scroll direction used during the last render.
-    pub(crate) scroll_direction: ScrollDirection,
-
     /// The viewport's main axis size from the last render.
     pub(crate) last_main_axis_size: u16,
+
+    /// The gap size between visible items from the last render.
+    pub(crate) gap_size: u16,
+
+    /// The offset of the content along the main axis from the last render. It is
+    /// non-zero when the content is aligned to the end of the axis.
+    pub(crate) main_axis_offset: u16,
 
     /// Full (untruncated) main-axis sizes of items from the last render.
     pub(crate) total_main_axis_sizes: HashMap<usize, u16>,
@@ -71,8 +83,9 @@ impl Default for ViewState {
             visible_main_axis_sizes: HashMap::new(),
             inner_area: Rect::default(),
             scroll_axis: ScrollAxis::Vertical,
-            scroll_direction: ScrollDirection::Forward,
             last_main_axis_size: 0,
+            gap_size: 0,
+            main_axis_offset: 0,
             total_main_axis_sizes: HashMap::new(),
         }
     }
@@ -85,6 +98,7 @@ impl Default for ListState {
             num_elements: 0,
             infinite_scrolling: true,
             item_scroll: 0,
+            anchor_to_end: true,
             view_state: ViewState::default(),
             scrollbar_state: ScrollbarState::new(0).position(0),
         }
@@ -121,6 +135,7 @@ impl ListState {
 
     /// Selects an item by its index.
     pub fn select(&mut self, index: Option<usize>) {
+        self.update_anchor(self.selected, index);
         self.selected = index;
         self.item_scroll = 0;
         if index.is_none() {
@@ -206,6 +221,7 @@ impl ListState {
         // If the previous item overflows the viewport, start at its bottom
         let overflow = self.item_overflow(i);
         if overflow > 0 {
+            self.update_anchor(self.selected, Some(i));
             self.selected = Some(i);
             self.item_scroll = overflow;
             return;
@@ -248,6 +264,7 @@ impl ListState {
         main_axis_size: u16,
         cross_axis_size: u16,
         scroll_axis: ScrollAxis,
+        gap_size: u16,
     ) {
         let mut max_scrollbar_position = 0;
         let mut cumulative_size = 0;
@@ -261,6 +278,10 @@ impl ListState {
             };
             let (_, widget_size) = builder.call_closure(&context);
             cumulative_size += widget_size;
+            // The gap in front of the next item occupies space as well.
+            if index + 1 < item_count {
+                cumulative_size += gap_size;
+            }
 
             if cumulative_size > main_axis_size {
                 max_scrollbar_position = index + 1;
@@ -306,17 +327,6 @@ impl ListState {
         self.view_state.scroll_axis
     }
 
-    /// Set the scroll direction used during the last render.
-    pub(crate) fn set_scroll_direction(&mut self, scroll_direction: ScrollDirection) {
-        self.view_state.scroll_direction = scroll_direction;
-    }
-
-    /// Get the scroll direction used during the last render.
-    #[must_use]
-    pub(crate) fn last_scroll_direction(&self) -> ScrollDirection {
-        self.view_state.scroll_direction
-    }
-
     /// Returns how many rows/cols of the item extend beyond the viewport,
     /// or 0 if the item fits or its size is not cached.
     fn item_overflow(&self, index: usize) -> u16 {
@@ -330,6 +340,84 @@ impl ListState {
     /// Set the viewport's main axis size from the last render.
     pub(crate) fn set_last_main_axis_size(&mut self, size: u16) {
         self.view_state.last_main_axis_size = size;
+    }
+
+    /// Set the gap size between visible items from the last render.
+    pub(crate) fn set_gap_size(&mut self, gap_size: u16) {
+        self.view_state.gap_size = gap_size;
+    }
+
+    /// Get the gap size between visible items from the last render.
+    #[must_use]
+    pub(crate) fn gap_size(&self) -> u16 {
+        self.view_state.gap_size
+    }
+
+    /// Returns whether the content should be anchored to the end of the viewport.
+    #[must_use]
+    pub(crate) fn anchor_to_end(&self) -> bool {
+        self.anchor_to_end
+    }
+
+    /// Set whether the content should be anchored to the end of the viewport.
+    pub(crate) fn set_anchor_to_end(&mut self, anchor_to_end: bool) {
+        self.anchor_to_end = anchor_to_end;
+    }
+
+    /// Returns `true` if all items of the list fit into the current viewport.
+    fn whole_list_is_visible(&self) -> bool {
+        self.num_elements > 0 && self.view_state.visible_main_axis_sizes.len() == self.num_elements
+    }
+
+    /// Updates the anchor based on a selection change. The content is anchored
+    /// to the start of the viewport when the selection moves above the top item
+    /// of the viewport while scrolling up and to the end when it moves below
+    /// the bottom item while scrolling down. Selecting an item that still fits
+    /// into the viewport keeps the current anchor, so that the content does not
+    /// jump between both edges while scrolling.
+    ///
+    /// If the whole list fits into the viewport there is nothing to scroll and
+    /// the content always stays anchored to the end.
+    fn update_anchor(&mut self, previous: Option<usize>, next: Option<usize>) {
+        if self.whole_list_is_visible() {
+            self.anchor_to_end = true;
+            return;
+        }
+        match (previous, next) {
+            (Some(previous), Some(next))
+                if next < previous && (next == 0 || next < self.view_state.offset) =>
+            {
+                self.anchor_to_end = false;
+            }
+            (Some(previous), Some(next))
+                if next > previous
+                    && (next + 1 == self.num_elements
+                        || self.last_visible_index().is_some_and(|last| next > last)) =>
+            {
+                self.anchor_to_end = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns the index of the last item that is visible in the current viewport.
+    fn last_visible_index(&self) -> Option<usize> {
+        self.view_state
+            .visible_main_axis_sizes
+            .keys()
+            .copied()
+            .max()
+    }
+
+    /// Set the content offset along the main axis from the last render.
+    pub(crate) fn set_main_axis_offset(&mut self, offset: u16) {
+        self.view_state.main_axis_offset = offset;
+    }
+
+    /// Get the content offset along the main axis from the last render.
+    #[must_use]
+    pub(crate) fn main_axis_offset(&self) -> u16 {
+        self.view_state.main_axis_offset
     }
 
     /// Set the full (untruncated) main-axis sizes of items from the last render.

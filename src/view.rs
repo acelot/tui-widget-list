@@ -37,6 +37,11 @@ pub struct ListView<'a, T> {
     /// The base block surrounding the widget list.
     pub block: Option<Block<'a>>,
 
+    /// The gap size between items. The gap is rendered as empty space only
+    /// between items that are visible on the viewport, so there is never a gap
+    /// before the first or after the last visible item.
+    pub gap_size: u16,
+
     /// The scrollbar.
     pub scrollbar: Option<Scrollbar<'a>>,
 
@@ -59,6 +64,7 @@ impl<'a, T> ListView<'a, T> {
             scroll_direction: ScrollDirection::Forward,
             style: Style::default(),
             block: None,
+            gap_size: 0,
             scrollbar: None,
             scroll_padding: 0,
             infinite_scrolling: true,
@@ -81,6 +87,14 @@ impl<'a, T> ListView<'a, T> {
     #[must_use]
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
+        self
+    }
+
+    /// Set the gap size between items. The gap is rendered as empty space only
+    /// between items that are visible on the viewport.
+    #[must_use]
+    pub fn gap_size(mut self, gap_size: u16) -> Self {
+        self.gap_size = gap_size;
         self
     }
 
@@ -284,7 +298,7 @@ impl<T: Widget> StatefulWidget for ListView<'_, T> {
         state.set_infinite_scrolling(self.infinite_scrolling);
         state.set_inner_area(inner_area);
         state.set_scroll_axis(self.scroll_axis);
-        state.set_scroll_direction(self.scroll_direction);
+        state.set_gap_size(self.gap_size);
 
         if self.item_count == 0 {
             return;
@@ -303,6 +317,7 @@ impl<T: Widget> StatefulWidget for ListView<'_, T> {
             cross_axis_size,
             self.scroll_axis,
             self.scroll_padding,
+            self.gap_size,
         );
 
         let (start, end) = (
@@ -310,24 +325,56 @@ impl<T: Widget> StatefulWidget for ListView<'_, T> {
             viewport.len() + state.view_state.offset,
         );
 
-        // Backward direction: align items to the end of the axis
-        if self.scroll_direction == ScrollDirection::Backward {
-            let total_visible: u16 = (start..end)
-                .filter_map(|i| viewport.get(&i))
-                .map(|e| e.visible_size())
-                .sum();
-            scroll_axis_pos += main_axis_size.saturating_sub(total_visible);
+        // If the whole list fits into the viewport there is nothing to scroll,
+        // so the content always stays anchored to the end and does not jump to
+        // the start when the first item is selected.
+        if start == 0 && end == self.item_count {
+            state.set_anchor_to_end(true);
         }
+
+        // Backward direction: align items to the end of the axis if the content
+        // is anchored at the end, i.e. after the selection moved below the
+        // viewport while scrolling down. Otherwise it sticks to the start of
+        // the axis and the unused space stays at the end.
+        let mut main_axis_offset = 0;
+        if self.scroll_direction == ScrollDirection::Backward && state.anchor_to_end() {
+            let mut total_visible: u16 = 0;
+            let mut visible_count: u16 = 0;
+            for i in start..end {
+                if let Some(element) = viewport.get(&i) {
+                    let size = element.visible_size();
+                    if size > 0 {
+                        total_visible = total_visible.saturating_add(size);
+                        visible_count = visible_count.saturating_add(1);
+                    }
+                }
+            }
+            let total_gap = self
+                .gap_size
+                .saturating_mul(visible_count.saturating_sub(1));
+            main_axis_offset =
+                main_axis_size.saturating_sub(total_visible.saturating_add(total_gap));
+        }
+        scroll_axis_pos += main_axis_offset;
+        state.set_main_axis_offset(main_axis_offset);
 
         // Render each visible item and cache sizes for hit testing
         let mut cached_sizes: HashMap<usize, u16> = HashMap::new();
         let mut cached_total_sizes: HashMap<usize, u16> = HashMap::new();
         let viewport_end = scroll_axis_pos + main_axis_size;
+        let mut is_first_visible = true;
 
         for i in start..end {
             let Some(element) = viewport.remove(&i) else {
                 break;
             };
+
+            // Render the gap only between items that are visible. Items at the
+            // edge of the viewport are never preceded by a gap.
+            if !is_first_visible {
+                scroll_axis_pos = scroll_axis_pos.saturating_add(self.gap_size);
+            }
+            is_first_visible = false;
 
             cached_total_sizes.insert(i, element.main_axis_size);
 
@@ -375,6 +422,7 @@ impl<T: Widget> StatefulWidget for ListView<'_, T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_viewport<T>(
     state: &mut ListState,
     builder: &ListBuilder<T>,
@@ -383,6 +431,7 @@ fn resolve_viewport<T>(
     cross_axis_size: u16,
     scroll_axis: ScrollAxis,
     scroll_padding: u16,
+    gap_size: u16,
 ) -> HashMap<usize, ViewportElement<T>> {
     let viewport = compute_viewport_layout(
         state,
@@ -392,6 +441,7 @@ fn resolve_viewport<T>(
         cross_axis_size,
         scroll_axis,
         scroll_padding,
+        gap_size,
     );
     state.update_scrollbar_state(
         builder,
@@ -399,6 +449,7 @@ fn resolve_viewport<T>(
         main_axis_size,
         cross_axis_size,
         scroll_axis,
+        gap_size,
     );
     viewport
 }
@@ -751,6 +802,310 @@ mod test {
             make_list().render(large, &mut buf, &mut state);
             assert_buffer_eq(buf, full_viewport.clone());
         }
+    }
+
+    #[test]
+    fn gap_between_items() {
+        // given: 3 items of 3 rows each and a gap of 1 row in between
+        let area = Rect::new(0, 0, 5, 11);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 3).gap_size(1);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then: the gap is rendered only between the items, not at the edges
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec![
+                "┌───┐",
+                "│   │",
+                "└───┘",
+                "     ",
+                "┌───┐",
+                "│   │",
+                "└───┘",
+                "     ",
+                "┌───┐",
+                "│   │",
+                "└───┘",
+            ]),
+        );
+    }
+
+    #[test]
+    fn no_gap_without_visible_neighbour() {
+        // given: viewport of 5 rows, items of 3 rows and a gap of 2 rows.
+        // The second item does not fit, so it is not visible at all.
+        let area = Rect::new(0, 0, 5, 5);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 3).gap_size(2);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then: the gap is not rendered because the next item is not visible
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec!["┌───┐", "│   │", "└───┘", "     ", "     "]),
+        );
+    }
+
+    #[test]
+    fn gap_before_partially_visible_item() {
+        // given: viewport of 6 rows, items of 3 rows and a gap of 2 rows.
+        // Only the first row of the second item fits below the gap.
+        let area = Rect::new(0, 0, 5, 6);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 3).gap_size(2);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec!["┌───┐", "│   │", "└───┘", "     ", "     ", "┌───┐"]),
+        );
+    }
+
+    #[test]
+    fn no_gap_above_truncated_first_item() {
+        // given: viewport of 6 rows, items of 3 rows, gap of 1 row and the last
+        // item selected. The first visible item is truncated at the top, so no
+        // gap may be rendered above it.
+        let area = Rect::new(0, 0, 5, 6);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 3).gap_size(1);
+        let mut state = ListState::default();
+        state.select(Some(2));
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec!["│   │", "└───┘", "     ", "┌───┐", "│   │", "└───┘"]),
+        );
+    }
+
+    #[test]
+    fn horizontal_gap_between_items() {
+        // given: 3 items of 3 columns each and a gap of 1 column
+        let area = Rect::new(0, 0, 11, 3);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 3)
+            .scroll_axis(ScrollAxis::Horizontal)
+            .gap_size(1);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec!["┌─┐ ┌─┐ ┌─┐", "│ │ │ │ │ │", "└─┘ └─┘ └─┘"]),
+        );
+    }
+
+    #[test]
+    fn backward_direction_aligns_items_with_gaps_to_the_end() {
+        // given: 2 items of 3 rows and a gap of 1 row on a viewport of 9 rows
+        let area = Rect::new(0, 0, 5, 9);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 2)
+            .gap_size(1)
+            .scroll_direction(ScrollDirection::Backward);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then: the items and the gap are aligned to the bottom
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec![
+                "     ",
+                "     ",
+                "┌───┐",
+                "│   │",
+                "└───┘",
+                "     ",
+                "┌───┐",
+                "│   │",
+                "└───┘",
+            ]),
+        );
+    }
+
+    #[test]
+    fn backward_direction_anchors_only_when_the_selection_leaves_the_viewport() {
+        // given: viewport of 9 rows, 5 items of 2 rows and a gap of 1 row. The
+        // last row stays unused because the next gap does not fit.
+        let area = Rect::new(0, 0, 5, 9);
+        let make_list = || {
+            ListView::new(ListBuilder::new(|_| (TestItem {}, 2)), 5)
+                .gap_size(1)
+                .scroll_direction(ScrollDirection::Backward)
+        };
+        let bottom_aligned = Buffer::with_lines(vec![
+            "     ",
+            "┌───┐",
+            "└───┘",
+            "     ",
+            "┌───┐",
+            "└───┘",
+            "     ",
+            "┌───┐",
+            "└───┘",
+        ]);
+        let top_aligned = Buffer::with_lines(vec![
+            "┌───┐",
+            "└───┘",
+            "     ",
+            "┌───┐",
+            "└───┘",
+            "     ",
+            "┌───┐",
+            "└───┘",
+            "     ",
+        ]);
+
+        let mut state = ListState::default();
+        state.select(Some(2));
+
+        // the list is anchored to the bottom by default
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned.clone());
+        assert_eq!(state.main_axis_offset(), 1);
+
+        // scrolling up to a fully visible item keeps the anchor
+        state.previous();
+        assert_eq!(state.selected, Some(1));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned.clone());
+
+        // scrolling up to the first item anchors to the top
+        state.previous();
+        assert_eq!(state.selected, Some(0));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, top_aligned.clone());
+        assert_eq!(state.main_axis_offset(), 0);
+
+        // scrolling down to a fully visible item keeps the anchor
+        state.next();
+        assert_eq!(state.selected, Some(1));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, top_aligned.clone());
+
+        // the bottom item still fits into the viewport, so the anchor is kept
+        state.next();
+        assert_eq!(state.selected, Some(2));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, top_aligned);
+
+        // only the next selection leaves the viewport and anchors to the bottom
+        state.next();
+        assert_eq!(state.selected, Some(3));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned);
+        assert_eq!(state.main_axis_offset(), 1);
+    }
+
+    #[test]
+    fn backward_direction_does_not_jump_when_the_whole_list_fits() {
+        // given: viewport of 10 rows, 2 items of 2 rows and a gap of 1 row.
+        // All items fit into the viewport, so the content stays anchored to the
+        // bottom and does not jump to the top when items are selected.
+        let area = Rect::new(0, 0, 5, 10);
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let make_list = || {
+            ListView::new(ListBuilder::new(|_| (TestItem {}, 2)), 2)
+                .gap_size(1)
+                .scroll_direction(ScrollDirection::Backward)
+        };
+        let bottom_aligned = Buffer::with_lines(vec![
+            "     ",
+            "     ",
+            "     ",
+            "     ",
+            "     ",
+            "┌───┐",
+            "└───┘",
+            "     ",
+            "┌───┐",
+            "└───┘",
+        ]);
+
+        // when rendering with the first item selected
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned.clone());
+
+        // when scrolling down to the last item
+        state.next();
+        assert_eq!(state.selected, Some(1));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned.clone());
+
+        // when scrolling up to the first item again
+        state.previous();
+        assert_eq!(state.selected, Some(0));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_buffer_eq(buf, bottom_aligned);
+    }
+
+    #[test]
+    fn backward_direction_sticks_to_top_when_first_item_is_selected() {
+        // given: the last item is selected, so the content is anchored to the
+        // bottom
+        let area = Rect::new(0, 0, 5, 10);
+        let mut state = ListState::default();
+        state.select(Some(4));
+        let make_list = || {
+            ListView::new(ListBuilder::new(|_| (TestItem {}, 3)), 5)
+                .gap_size(2)
+                .scroll_direction(ScrollDirection::Backward)
+        };
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+
+        // when scrolling up to the first item
+        state.select(Some(0));
+        let mut buf = Buffer::empty(area);
+        make_list().render(area, &mut buf, &mut state);
+        assert_eq!(state.scroll_offset_index(), 0);
+
+        // then: the content sticks to the top, the unused space stays below
+        assert_buffer_eq(
+            buf,
+            Buffer::with_lines(vec![
+                "┌───┐",
+                "│   │",
+                "└───┘",
+                "     ",
+                "     ",
+                "┌───┐",
+                "│   │",
+                "└───┘",
+                "     ",
+                "     ",
+            ]),
+        );
     }
 
     fn assert_buffer_eq(actual: Buffer, expected: Buffer) {

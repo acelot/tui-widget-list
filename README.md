@@ -13,16 +13,20 @@ The list view supports both horizontal and vertical scrolling.
 ![](https://raw.githubusercontent.com/preiter93/tui-widget-list/main/examples/tapes/variants.gif?v=1)
 
 ### Configuration
+
 `ListView` can be customized with the following options:
+
 - `ListView::scroll_axis`: Scroll vertically or horizontally.
 - `ListView::scroll_direction`: Lay items out forward or in reverse.
 - `ListView::scroll_padding`: Keep a number of items visible around the selected item while scrolling.
+- `ListView::gap_size`: Render empty space between visible items.
 - `ListView::infinite_scrolling`: Wrap around when scrolling past the first or last item.
 - `ListView::style`: Base style applied to the entire list.
 - `ListView::block`: Optional surrounding block.
 - `ListView::scrollbar`: Optional scrollbar overlay.
 
 ### Example
+
 ```rust
 use ratatui::prelude::*;
 use tui_widget_list::{ListBuilder, ListState, ListView};
@@ -42,6 +46,7 @@ let list = ListView::new(builder, 20);
 ### Mouse handling
 
 Handle mouse clicks and scroll events using `ListState::hit_test`:
+
 ```rust
 use tui_widget_list::hit_test::Hit;
 
@@ -72,6 +77,7 @@ match event::read()? {
 ```
 
 ### Documentation
+
 For more examples see the [examples directory](https://github.com/preiter93/tui-widget-list/tree/main/examples). Full API documentation is available on [docs.rs](https://docs.rs/tui-widget-list/).
 
 [Crate Badge]: https://img.shields.io/crates/v/tui-widget-list?logo=rust&style=flat-square&logoColor=E05D44&color=E05D44

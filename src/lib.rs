@@ -17,6 +17,7 @@
 //! - `ListView::scroll_axis`: Scroll vertically or horizontally.
 //! - `ListView::scroll_direction`: Lay items out forward or in reverse.
 //! - `ListView::scroll_padding`: Keep a number of items visible around the selected item while scrolling.
+//! - `ListView::gap_size`: Render empty space between visible items.
 //! - `ListView::infinite_scrolling`: Wrap around when scrolling past the first or last item.
 //! - `ListView::style`: Base style applied to the entire list.
 //! - `ListView::block`: Optional surrounding block.

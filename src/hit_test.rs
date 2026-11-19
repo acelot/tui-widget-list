@@ -32,20 +32,23 @@ impl ListState {
             return None;
         }
 
-        let (main_axis_size, cross_axis_size) = scroll_axis.sizes(inner_area);
-        let scroll_direction = self.last_scroll_direction();
+        let (_, cross_axis_size) = scroll_axis.sizes(inner_area);
+        let gap_size = self.gap_size();
 
-        let (mut scroll_axis_pos, cross_axis_pos) = scroll_axis.origin(inner_area);
-
-        if scroll_direction == crate::ScrollDirection::Backward {
-            let total_visible: u16 = sizes.values().sum();
-            scroll_axis_pos += main_axis_size.saturating_sub(total_visible);
-        }
+        let (scroll_axis_pos, cross_axis_pos) = scroll_axis.origin(inner_area);
+        let mut scroll_axis_pos = scroll_axis_pos.saturating_add(self.main_axis_offset());
 
         let start_index = self.scroll_offset_index();
         let mut index = start_index;
+        let mut previous_visible = false;
 
         while let Some(visible_main_axis_size) = sizes.get(&index).copied() {
+            // Skip over the gap that is rendered between two visible items.
+            if previous_visible && visible_main_axis_size > 0 {
+                scroll_axis_pos = scroll_axis_pos.saturating_add(gap_size);
+            }
+            previous_visible = visible_main_axis_size > 0;
+
             let rect = scroll_axis.rect(
                 scroll_axis_pos,
                 cross_axis_pos,
@@ -68,7 +71,7 @@ impl ListState {
 #[cfg(test)]
 mod tests {
     use crate::hit_test::Hit;
-    use crate::{ListBuilder, ListState, ListView, ScrollAxis};
+    use crate::{ListBuilder, ListState, ListView, ScrollAxis, ScrollDirection};
     use ratatui::buffer::Buffer;
     use ratatui::prelude::{Rect, StatefulWidget, Style};
     use ratatui::text::{Line, Span};
@@ -182,5 +185,45 @@ mod tests {
             scroll_pos = scroll_pos.saturating_add(*visible);
             index += 1;
         }
+    }
+
+    #[test]
+    fn hit_test_returns_area_inside_gap_between_items() {
+        // given: 3 items of 2 rows with a gap of 1 row on a viewport of 6 rows
+        let builder = ListBuilder::new(|_| (Paragraph::new(""), 2));
+        let area = Rect::new(0, 0, 5, 6);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(builder, 3).gap_size(1);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then: rows 0-1 contain item 0, row 2 the gap, rows 3-4 item 1
+        assert_eq!(state.hit_test(2, 0), Some(Hit::Item(0)));
+        assert_eq!(state.hit_test(2, 2), Some(Hit::Area));
+        assert_eq!(state.hit_test(2, 3), Some(Hit::Item(1)));
+        assert_eq!(state.hit_test(2, 5), Some(Hit::Area));
+    }
+
+    #[test]
+    fn hit_test_with_gaps_in_backward_direction() {
+        // given: 2 items of 3 rows with a gap of 1 row, aligned to the bottom
+        let builder = ListBuilder::new(|_| (Paragraph::new(""), 3));
+        let area = Rect::new(0, 0, 5, 9);
+        let mut buf = Buffer::empty(area);
+        let list = ListView::new(builder, 2)
+            .gap_size(1)
+            .scroll_direction(ScrollDirection::Backward);
+        let mut state = ListState::default();
+
+        // when
+        list.render(area, &mut buf, &mut state);
+
+        // then: rows 2-4 contain item 0, row 5 the gap, rows 6-8 item 1
+        assert_eq!(state.hit_test(2, 1), Some(Hit::Area));
+        assert_eq!(state.hit_test(2, 2), Some(Hit::Item(0)));
+        assert_eq!(state.hit_test(2, 5), Some(Hit::Area));
+        assert_eq!(state.hit_test(2, 6), Some(Hit::Item(1)));
     }
 }

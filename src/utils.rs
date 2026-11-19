@@ -20,7 +20,11 @@ use crate::{view::Truncation, ListBuildContext, ListBuilder, ListState, ScrollAx
 /// - Selected item is below the previous viewport, either truncated or out of bounds
 ///      - If it is truncated, the viewport will be adjusted to bring the entire item into view.
 ///      - If it is out of bounds, the viewport will be scrolled downwards to make the selected item visible.
-#[allow(clippy::too_many_lines)]
+///
+/// `gap_size` is the amount of empty space that is rendered between two visible
+/// items. It is accounted for in the layout so that items never overflow the
+/// viewport, but it is only reserved between items that are actually visible.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn compute_viewport_layout<T>(
     state: &mut ListState,
     builder: &ListBuilder<T>,
@@ -29,6 +33,7 @@ pub(crate) fn compute_viewport_layout<T>(
     cross_axis_size: u16,
     scroll_axis: ScrollAxis,
     scroll_padding: u16,
+    gap_size: u16,
 ) -> HashMap<usize, ViewportElement<T>> {
     // Cache the widgets and sizes to evaluate the builder less often.
     let mut cacher = WidgetCacher::new(builder, scroll_axis, cross_axis_size, state.selected);
@@ -47,6 +52,7 @@ pub(crate) fn compute_viewport_layout<T>(
         cross_axis_size,
         scroll_axis,
         scroll_padding,
+        gap_size,
     );
 
     update_offset(
@@ -54,6 +60,7 @@ pub(crate) fn compute_viewport_layout<T>(
         &mut cacher,
         selected,
         &effective_scroll_padding_by_index,
+        gap_size,
     );
 
     // Begin a forward pass, starting from `view_state.offset`.
@@ -66,11 +73,16 @@ pub(crate) fn compute_viewport_layout<T>(
         total_main_axis_size,
         selected,
         &effective_scroll_padding_by_index,
+        gap_size,
     );
 
     // The forward pass is sufficient if the selected item is visible and the
-    // viewport has been filled completely.
-    if found_selected && remaining_space == 0 {
+    // viewport has been filled completely. It is also sufficient if the pass
+    // stopped because the next item does not fit onto the viewport anymore.
+    // Only if the pass ran out of items, the layout is anchored at the last
+    // item instead (e.g. after the terminal has been enlarged).
+    let reached_end = state.view_state.offset + viewport.len() >= item_count;
+    if found_selected && (remaining_space == 0 || !reached_end) {
         return viewport;
     }
 
@@ -98,6 +110,7 @@ pub(crate) fn compute_viewport_layout<T>(
         anchor,
         selected,
         &effective_scroll_padding_by_index,
+        gap_size,
     );
 
     viewport
@@ -111,6 +124,7 @@ fn update_offset<T>(
     cacher: &mut WidgetCacher<T>,
     selected: usize,
     scroll_padding_by_index: &HashMap<usize, u16>,
+    gap_size: u16,
 ) {
     // Get the top padding for scrolling or default to 0 if not present
     let scroll_padding_top = *scroll_padding_by_index.get(&selected).unwrap_or(&0);
@@ -133,8 +147,12 @@ fn update_offset<T>(
         // Get the size of the current element
         let main_axis_size = cacher.get_height(index);
 
+        // The gap between this element and the one below it is part of the
+        // scroll padding and therefore consumes space as well.
+        let gap_after = if index < selected { gap_size } else { 0 };
+
         // Update the available space
-        available_size = available_size.saturating_sub(main_axis_size);
+        available_size = available_size.saturating_sub(main_axis_size.saturating_add(gap_after));
 
         // Calculate the truncated size if there's still space
         if available_size > 0 {
@@ -166,6 +184,7 @@ fn forward_pass<T>(
     total_main_axis_size: u16,
     selected: usize,
     scroll_padding_by_index: &HashMap<usize, u16>,
+    gap_size: u16,
 ) -> (bool, u16) {
     // Check if the selected item is in the current view
     let mut found_last = false;
@@ -182,12 +201,23 @@ fn forward_pass<T>(
             total_main_axis_size
         };
 
+        // The gap is only rendered between two visible items. Hence, the first
+        // visible item has no leading gap.
+        let gap_before = if is_first { 0 } else { gap_size };
+        let required_size = main_axis_size.saturating_add(gap_before);
+
         // The effective available size considering scroll padding.
         let scroll_padding_effective = scroll_padding_by_index.get(&index).unwrap_or(&0);
         let available_effective = available_size.saturating_sub(*scroll_padding_effective);
 
         // Out of bounds
-        if !found_selected && main_axis_size >= available_effective {
+        if !found_selected && required_size >= available_effective {
+            break;
+        }
+
+        // Only the gap fits, but not the item itself. In this case neither the
+        // item nor the gap is visible, so the pass stops here.
+        if gap_before > 0 && available_size <= gap_before {
             break;
         }
 
@@ -197,7 +227,7 @@ fn forward_pass<T>(
             found_selected = true;
         }
 
-        let truncation = match available_size.cmp(&main_axis_size) {
+        let truncation = match available_size.cmp(&required_size) {
             // We found the last element and it fits onto the viewport
             Ordering::Equal => {
                 found_last = true;
@@ -210,7 +240,7 @@ fn forward_pass<T>(
             // We found the last element but it needs to be truncated
             Ordering::Less => {
                 found_last = true;
-                let value = main_axis_size.saturating_sub(available_size);
+                let value = required_size.saturating_sub(available_size);
                 if is_first {
                     state.view_state.first_truncated = value;
                 }
@@ -232,7 +262,7 @@ fn forward_pass<T>(
             ViewportElement::new(widget, total_main_axis_size, truncation.clone()),
         );
 
-        available_size = available_size.saturating_sub(main_axis_size);
+        available_size = available_size.saturating_sub(required_size);
 
         if found_last {
             break;
@@ -256,6 +286,7 @@ fn backward_pass<T>(
     anchor: usize,
     selected: usize,
     scroll_padding_by_index: &HashMap<usize, u16>,
+    gap_size: u16,
 ) {
     let mut found_first = false;
     let mut available_size = total_main_axis_size;
@@ -271,9 +302,14 @@ fn backward_pass<T>(
     for index in (0..=anchor).rev() {
         let (widget, main_axis_size) = cacher.get(index);
 
+        // The gap between this item and the one below it. The anchor item has
+        // no gap after it because nothing is rendered below it.
+        let gap_after = if index < anchor { gap_size } else { 0 };
+        let required_size = main_axis_size.saturating_add(gap_after);
+
         let available_effective = available_size.saturating_sub(scroll_padding_effective);
 
-        let truncation = match available_effective.cmp(&main_axis_size) {
+        let truncation = match available_effective.cmp(&required_size) {
             // We found the first element and it fits into the viewport
             Ordering::Equal => {
                 found_first = true;
@@ -283,10 +319,19 @@ fn backward_pass<T>(
             }
             // We found the first element but it needs to be truncated
             Ordering::Less => {
+                // Only the gap fits, but not the item itself. In this case
+                // neither the item nor the gap is visible, so the pass stops
+                // at the item below the gap.
+                if gap_after > 0 && available_effective <= gap_after {
+                    state.view_state.offset = index + 1;
+                    state.view_state.first_truncated = 0;
+                    found_first = true;
+                    break;
+                }
                 found_first = true;
                 state.view_state.offset = index;
                 state.view_state.first_truncated =
-                    main_axis_size.saturating_sub(available_effective);
+                    required_size.saturating_sub(available_effective);
                 // Truncate from the bottom if there is only one element on the viewport
                 if index == anchor && anchor == selected {
                     Truncation::Bot(state.view_state.first_truncated)
@@ -304,7 +349,7 @@ fn backward_pass<T>(
             break;
         }
 
-        available_size -= main_axis_size;
+        available_size -= required_size;
     }
 
     // All items from the top of the list fit into the viewport. Make sure the
@@ -322,16 +367,26 @@ fn backward_pass<T>(
         for index in selected + 1..item_count {
             let (widget, main_axis_size) = cacher.get(index);
 
-            let truncation = match available_size.cmp(&main_axis_size) {
+            // The gap is rendered between the previous item and this one.
+            let gap_before = gap_size;
+
+            // Only the gap fits, but not the item itself. Neither is visible.
+            if gap_before > 0 && available_size <= gap_before {
+                break;
+            }
+
+            let required_size = main_axis_size.saturating_add(gap_before);
+
+            let truncation = match available_size.cmp(&required_size) {
                 Ordering::Greater | Ordering::Equal => Truncation::None,
-                Ordering::Less => Truncation::Bot(main_axis_size.saturating_sub(available_size)),
+                Ordering::Less => Truncation::Bot(required_size.saturating_sub(available_size)),
             };
             viewport.insert(
                 index,
                 ViewportElement::new(widget, main_axis_size, truncation),
             );
 
-            available_size = available_size.saturating_sub(main_axis_size);
+            available_size = available_size.saturating_sub(required_size);
             // Out of bounds
             if available_size == 0 {
                 break;
@@ -356,6 +411,7 @@ fn calculate_effective_scroll_padding<T>(
     cross_axis_size: u16,
     scroll_axis: ScrollAxis,
     scroll_padding: u16,
+    gap_size: u16,
 ) -> HashMap<usize, u16> {
     let mut padding_by_element = HashMap::new();
     let mut total_main_axis_size = 0;
@@ -375,7 +431,10 @@ fn calculate_effective_scroll_padding<T>(
         };
 
         let (_, item_main_axis_size) = builder.call_closure(&context);
-        total_main_axis_size += item_main_axis_size;
+        // The gap to the next item is part of the space above it.
+        total_main_axis_size = total_main_axis_size
+            .saturating_add(item_main_axis_size)
+            .saturating_add(if index + 1 < item_count { gap_size } else { 0 });
     }
 
     total_main_axis_size = 0;
@@ -394,7 +453,10 @@ fn calculate_effective_scroll_padding<T>(
         };
 
         let (_, item_main_axis_size) = builder.call_closure(&context);
-        total_main_axis_size += item_main_axis_size;
+        // The gap to the item above is part of the space below it.
+        total_main_axis_size = total_main_axis_size
+            .saturating_add(item_main_axis_size)
+            .saturating_add(if index > 0 { gap_size } else { 0 });
     }
 
     padding_by_element
@@ -583,6 +645,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             0,
+            0,
         );
 
         // then
@@ -644,6 +707,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             0,
+            0,
         );
 
         // then
@@ -698,6 +762,7 @@ mod tests {
             given_total_size,
             1,
             ScrollAxis::Vertical,
+            0,
             0,
         );
 
@@ -758,6 +823,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             1,
+            0,
         );
 
         // then
@@ -823,6 +889,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             1,
+            0,
         );
 
         // then
@@ -883,6 +950,7 @@ mod tests {
             given_total_size,
             1,
             ScrollAxis::Vertical,
+            0,
             0,
         );
 
@@ -952,6 +1020,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             0,
+            0,
         );
 
         // then
@@ -1000,6 +1069,7 @@ mod tests {
             given_total_size,
             1,
             ScrollAxis::Vertical,
+            0,
             0,
         );
 
@@ -1051,6 +1121,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             0,
+            0,
         );
 
         // then
@@ -1076,6 +1147,7 @@ mod tests {
             1,
             ScrollAxis::Vertical,
             scroll_padding,
+            0,
         );
 
         assert_eq!(*scroll_padding.get(&0).unwrap(), 0);
